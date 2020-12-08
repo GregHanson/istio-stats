@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GregHanson/istio-stats/community-testing"
 	"github.com/GregHanson/istio-stats/queries"
 	"github.com/shurcooL/githubv4"
 	"golang.org/x/oauth2"
@@ -26,7 +27,8 @@ var (
 	days            int64
 	sheetID         string
 	priorities      map[githubv4.String][]*queries.Issue
-	client          *githubv4.Client
+	githubClient    *githubv4.Client
+	testStats       community.TestStats
 )
 
 func init() {
@@ -44,20 +46,20 @@ func main() {
 		&oauth2.Token{AccessToken: token},
 	)
 	httpClient := oauth2.NewClient(context.Background(), src)
-	client = githubv4.NewClient(httpClient)
+	githubClient = githubv4.NewClient(httpClient)
 
 	getIssues()
 	stats()
 }
 
 func getIssues() {
-	q := queries.IssueQuery{}
+	q := queries.MilestoneIssueQuery{}
 	variables := map[string]interface{}{
 		"commentsCursor": (*githubv4.String)(nil), // Null after argument to get first page.
 		"name":           githubv4.String("istio"),
 	}
 	for {
-		err := client.Query(context.Background(), &q, variables)
+		err := githubClient.Query(context.Background(), &q, variables)
 		if err != nil {
 			fmt.Printf("%v\n", q)
 			log.Fatalf("Query failed, err: %v", err)
@@ -89,12 +91,13 @@ func processIssues() {
 
 	var vr sheets.ValueRange
 
-	for priority, issues := range priorities {
-		fmt.Printf("Priority {%v} has {%v} items OPEN in it\n", priority, len(issues))
-		for _, issue := range issues {
+	p := []githubv4.String{"Release  Blocker", "P0", "P1", "P2", "> P2"}
+	for _, priority := range p {
+		fmt.Printf("Priority {%v} has {%v} items OPEN in it\n", priority, len(priorities[priority]))
+		for _, issue := range priorities[priority] {
 			stale := ""
 			if !issue.LastEditedAt.Time.Add(staleFactor).Before(time.Now()) {
-				fmt.Printf("\tStale: %v", issue.Title)
+				fmt.Printf("\tStale: %v\n", issue.Title)
 				stale = "STALE"
 			}
 			area := ""
@@ -124,26 +127,37 @@ func getAssignees(i *queries.Issue) string {
 	return retval
 }
 
-// TODO: escalation for issues and pulls
-
 func stats() {
 	var vr sheets.ValueRange
-	processPullRequests(&vr)
-	processDailyIssues(&vr)
+	since := time.Now().Add(-time.Hour * 24 * 7)
+	checkSignup()
 
-	clearSheet("Stats!A2:I")
-	updateSheet("Stats!A2:I", &vr)
+	//processPullRequests(&vr)
+	istioIssues, docsIssues := processIssuesHistory(since)
+
+	vr.Values = append(vr.Values, []interface{}{since.Format("2006-01-02"),
+		len(testStats.Participants),
+		testStats.ClaimedTests,
+		testStats.Priority0.Claimed,
+		testStats.Priority0.Done,
+		testStats.Priority0.Automated,
+		testStats.Priority1.Claimed,
+		testStats.Priority1.Done,
+		testStats.Priority1.Automated,
+		testStats.Priority2.Claimed,
+		testStats.Priority2.Done,
+		testStats.Priority2.Automated,
+		(testStats.Priority0.Claimed + testStats.Priority1.Claimed + testStats.Priority2.Claimed) * 100 / testStats.Total,
+		testStats.ClaimedTests * 100 / testStats.Total,
+		istioIssues,
+		docsIssues,
+	})
+
+	updateSheet("Stats!A:P", &vr)
 }
 
-func processDailyIssues(vr *sheets.ValueRange) {
-
-	date := time.Now().Add(-time.Hour * 24).Format("2006-01-02")
-	url := "https://github.com/istio/istio/issues?q=is%3Aissue+is%3Aopen+sort%3Aupdated-desc+created%3A+" + date
-	vr.Values = append(vr.Values, []interface{}{"Istio daily Issues", getDailyIssues("istio"), url})
-	vr.Values = append(vr.Values, []interface{}{"", ""})
-	url = "https://github.com/istio/istio.io/issues?q=is%3Aissue+is%3Aopen+sort%3Aupdated-desc+created%3A+" + date
-	vr.Values = append(vr.Values, []interface{}{"Docs daily Issues", getDailyIssues("istio.io"), url})
-	vr.Values = append(vr.Values, []interface{}{"", ""})
+func processIssuesHistory(since time.Time) (int, int) {
+	return getDailyIssues("istio", since), getDailyIssues("istio.io", since)
 }
 
 func processPullRequests(vr *sheets.ValueRange) {
@@ -173,19 +187,27 @@ func processPullRequests(vr *sheets.ValueRange) {
 	vr.Values = append(vr.Values, []interface{}{"", ""})
 }
 
-func getDailyIssues(repo string) int {
-	q := queries.DailyIssueQuery{}
+func getDailyIssues(repo string, since time.Time) int {
+	q := queries.HistoricalIssueQuery{}
 	variables := map[string]interface{}{
-		"date": githubv4.String(time.Now().Add(-time.Hour * 24).Format(time.RFC3339)),
+		"date": githubv4.String(since.Format(time.RFC3339)),
 		"name": githubv4.String(repo),
 	}
-	err := client.Query(context.Background(), &q, variables)
+	err := githubClient.Query(context.Background(), &q, variables)
 	if err != nil {
 		fmt.Printf("%v\n", q)
 		log.Fatalf("Query failed, err: %v", err)
 	}
+
+	issuesSince := 0
+	for _, edge := range q.Repository.Issues.Edges {
+		if edge.Node.CreatedAt.Time.After(since) {
+			issuesSince++
+		}
+	}
+
 	fmt.Printf("retrieved daily issues for %v\n", repo)
-	return len(q.Repository.Issues.Edges)
+	return issuesSince
 }
 
 func getPullRequests(repo string) {
@@ -193,7 +215,7 @@ func getPullRequests(repo string) {
 	variables := map[string]interface{}{
 		"name": githubv4.String(repo),
 	}
-	err := client.Query(context.Background(), &q, variables)
+	err := githubClient.Query(context.Background(), &q, variables)
 	if err != nil {
 		fmt.Printf("%v\n", q)
 		log.Fatalf("Query failed, err: %v", err)
@@ -209,7 +231,6 @@ func updateSheet(sheetRange string, vr *sheets.ValueRange) {
 	if err != nil {
 		log.Fatalf("Unable to retrieve Sheets Client %v", err)
 	}
-
 	_, err = server.Spreadsheets.Values.Append(sheetID, sheetRange, vr).ValueInputOption("RAW").InsertDataOption("OVERWRITE").Do()
 
 	if err != nil {
@@ -233,4 +254,106 @@ func clearSheet(sheetRange string) {
 		log.Fatal(err)
 	}
 	fmt.Printf("cleared %v\n", sheetRange)
+}
+
+func checkError(err error) {
+	if err != nil {
+		panic(err.Error())
+	}
+}
+
+func checkSignup() {
+	srv, err := sheets.NewService(context.Background(), option.WithCredentialsFile(googleCreds), option.WithScopes(sheets.SpreadsheetsScope))
+	checkError(err)
+
+	spreadsheetID := "1g6qsYnIkLHMXn210HkB3pJCGQMC4Adr7fqqlWLJ8uw4"
+	readRange := "'Testing week 2'!B:H"
+	resp, err := srv.Spreadsheets.Values.Get(spreadsheetID, readRange).Do()
+	checkError(err)
+
+	docTests := []*community.DocTest{}
+
+	if len(resp.Values) == 0 {
+		fmt.Println("No data found.")
+	} else {
+		for rowIndex, row := range resp.Values {
+			if rowIndex == 0 {
+				continue
+			}
+			test := &community.DocTest{}
+			for i := 0; i <= 5; i++ {
+				if i >= len(row) {
+					break
+				}
+
+				switch i {
+				case 0:
+					test.Doc = fmt.Sprintf("%v", row[i])
+				case 1:
+					test.Priority = fmt.Sprintf("%v", row[i])
+				case 2:
+					test.Automated = fmt.Sprintf("%v", row[i])
+				case 3:
+					test.Assigned = fmt.Sprintf("%v", row[i])
+				case 4:
+					test.Inprogress = fmt.Sprintf("%v", row[i])
+				case 5:
+					test.DoneBy = fmt.Sprintf("%v", row[i])
+				}
+			}
+			if test.Automated != "" && test.Automated != "N/A" {
+				docTests = append(docTests, test)
+			}
+		}
+	}
+
+	participants := map[string]int{}
+	unclaimed := 0
+	testStats = community.TestStats{}
+	for _, test := range docTests {
+		claimed := 0
+		done := 0
+		if test.Assigned != "" {
+			participants[test.Assigned] = participants[test.Assigned] + 1
+			claimed = 1
+		}
+		if test.DoneBy != "" {
+			participants[test.DoneBy] = participants[test.DoneBy] + 1
+			done = 1
+		}
+		if test.Inprogress != "" {
+			participants[test.Inprogress] = participants[test.Inprogress] + 1
+			claimed = 1
+		}
+		if test.Assigned == "" && test.Inprogress == "" && test.DoneBy == "" {
+			unclaimed++
+		}
+
+		automated := 0
+		if test.Automated == "DONE" {
+			automated = 1
+		}
+
+		switch test.Priority {
+		case "P0":
+			testStats.Priority0.Automated += automated
+			testStats.Priority0.Claimed += claimed
+			testStats.Priority0.Done += done
+			testStats.Priority0.Total++
+		case "P1":
+			testStats.Priority1.Automated += automated
+			testStats.Priority1.Claimed += claimed
+			testStats.Priority1.Done += done
+			testStats.Priority1.Total++
+		case "P2":
+			testStats.Priority2.Automated += automated
+			testStats.Priority2.Claimed += claimed
+			testStats.Priority2.Done += done
+			testStats.Priority2.Total++
+		}
+	}
+	testStats.Participants = participants
+	testStats.ClaimedTests = len(docTests) - unclaimed
+	testStats.Total = len(docTests)
+	fmt.Printf("%+v\n", testStats)
 }

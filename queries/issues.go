@@ -43,7 +43,7 @@ type IssueNode struct {
 	Node Issue
 }
 
-type IssueQuery struct {
+type MilestoneIssueQuery struct {
 	Repository struct {
 		Milestone struct {
 			Title  githubv4.String
@@ -61,15 +61,16 @@ type IssueQuery struct {
 	}
 }
 
-type DailyIssueQuery struct {
+type HistoricalIssueQuery struct {
 	Repository struct {
 		Issues struct {
 			Edges []struct {
 				Node struct {
-					Title githubv4.String
+					Title     githubv4.String
+					CreatedAt githubv4.GitTimestamp
 				}
 			}
-		} `graphql:"issues(first: 100, filterBy:{states:OPEN, since: $date}, orderBy: {field:UPDATED_AT, direction:DESC})"`
+		} `graphql:"issues(first: 100, filterBy:{since:$date}, orderBy:{field:UPDATED_AT, direction:DESC})"`
 	} `graphql:"repository(name: $name, owner: \"istio\")"`
 	RateLimit struct {
 		Limit     githubv4.Int
